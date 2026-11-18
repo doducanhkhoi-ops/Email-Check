@@ -1,18 +1,20 @@
-import os
-import imaplib
 import email
-from email.header import decode_header
+import imaplib
+import json
+import os
+import re
 from datetime import datetime, timedelta
-from flask import Flask, render_template, request, jsonify
+from email.header import decode_header
+
+from flask import Flask, jsonify, render_template, request
 from google import genai
 from google.genai import types
-import json
 
 app = Flask(__name__)
 
 try:
     gemini_client = genai.Client()
-except Exception as e:
+except (ValueError, RuntimeError, OSError) as e:
     gemini_client = None
     print(f"Lỗi khởi tạo Gemini: {e}. Vui lòng set biến môi trường GEMINI_API_KEY")
 
@@ -55,7 +57,7 @@ def decode_mime_header(header_value):
         if isinstance(fragment, bytes):
             try:
                 header_text += fragment.decode(encoding or 'utf-8')
-            except:
+            except (UnicodeDecodeError, LookupError):
                 header_text += fragment.decode('utf-8', errors='ignore')
         else:
             header_text += str(fragment)
@@ -72,11 +74,13 @@ def get_email_body_from_msg(msg):
                 if content_type == "text/plain" and not text_body:
                     try:
                         text_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    except: pass
+                    except (AttributeError, UnicodeDecodeError):
+                        pass
                 elif content_type == "text/html" and not html_body:
                     try:
                         html_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    except: pass
+                    except (AttributeError, UnicodeDecodeError):
+                        pass
     else:
         content_type = msg.get_content_type()
         try:
@@ -85,12 +89,12 @@ def get_email_body_from_msg(msg):
                 html_body = payload
             else:
                 text_body = payload
-        except: pass
-        
+        except (AttributeError, UnicodeDecodeError):
+            pass
+
     if not html_body and text_body:
         html_body = f"<pre style='font-family: sans-serif; white-space: pre-wrap; padding: 1rem;'>{text_body}</pre>"
     if not text_body and html_body:
-        import re
         text_body = re.sub('<[^<]+>', ' ', html_body) 
         
     return text_body, html_body
@@ -99,7 +103,7 @@ def get_gmail_emails(account_email, days_back=0, exact_date_str=None):
     user, password = get_account_credentials(account_email)
     
     if not user or not password or user == "YOUR_GMAIL_ADDRESS@gmail.com":
-        raise Exception("Vui lòng cấu hình tài khoản Gmail và App Password trong file accounts.json")
+        raise ValueError("Vui lòng cấu hình tài khoản Gmail và App Password trong file accounts.json")
         
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
     mail.login(user, password)
@@ -132,7 +136,7 @@ def get_gmail_emails(account_email, days_back=0, exact_date_str=None):
                     if '<' in sender:
                         sender = sender.split('<')[0].strip()
                         
-                    text_b, html_b = get_email_body_from_msg(msg)
+                    text_b, _html_b = get_email_body_from_msg(msg)
                     preview = clean_text(text_b)[:100] + "..." if text_b else ""
                     
                     time_str = ""
@@ -140,7 +144,7 @@ def get_gmail_emails(account_email, days_back=0, exact_date_str=None):
                         try:
                             time_obj = email.utils.parsedate_to_datetime(msg.get("Date"))
                             time_str = time_obj.strftime("%H:%M %d/%m")
-                        except:
+                        except (TypeError, ValueError):
                             time_str = msg.get("Date")[:10]
                     
                     emails.append({
@@ -157,7 +161,7 @@ def get_email_body_by_id(account_email, entry_id):
     user, password = get_account_credentials(account_email)
     
     if not user or not password:
-        raise Exception(f"Lỗi: Không tìm thấy tài khoản {account_email} trong accounts.json")
+        raise ValueError(f"Lỗi: Không tìm thấy tài khoản {account_email} trong accounts.json")
         
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
     mail.login(user, password)
@@ -198,7 +202,7 @@ def fetch_emails():
     
     try:
         emails = get_gmail_emails(account_email, days, exact_date_str=exact_date)
-    except Exception as e:
+    except (ValueError, imaplib.IMAP4.error, OSError) as e:
         return jsonify({"error": str(e)})
     
     if not emails:
@@ -226,7 +230,7 @@ def fetch_emails():
             result[cat] = [e for e in emails if e['id'] in ids]
             
         return jsonify({"categories": result})
-    except Exception as e:
+    except (ValueError, RuntimeError, json.JSONDecodeError) as e:
         return jsonify({"error": str(e)})
 
 @app.route('/api/summarize', methods=['POST'])
@@ -236,7 +240,7 @@ def summarize_email():
     
     try:
         text_b, html_b = get_email_body_by_id(account_email, entry_id)
-    except Exception as e:
+    except (ValueError, imaplib.IMAP4.error, OSError) as e:
         return jsonify({"error": str(e)})
     
     if not text_b or len(text_b.strip()) == 0:
@@ -253,8 +257,8 @@ def summarize_email():
             contents=prompt
         )
         return jsonify({"summary": response.text, "html_content": html_b})
-    except Exception as e:
+    except (ValueError, RuntimeError) as e:
         return jsonify({"error": str(e), "html_content": html_b})
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=os.environ.get('FLASK_DEBUG', 'false').lower() == 'true', port=5000)
